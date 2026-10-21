@@ -1,5 +1,7 @@
 #include "test/integration/integration_admin_test.h"
 
+#include <atomic>
+#include <memory>
 #include <string>
 
 #include "envoy/admin/v3/config_dump.pb.h"
@@ -47,7 +49,113 @@ absl::string_view contentType(const BufferingStreamDecoderPtr& response) {
   return entry->value().getStringView();
 }
 
+struct AdminBackpressureState {
+  std::atomic<uint64_t> chunks{0};
+  absl::Notification destroyed;
+};
+
+class AdminBackpressureRequest : public Server::Admin::Request {
+public:
+  static constexpr uint64_t ChunkCount = 512;
+  static constexpr uint64_t ChunkSize = 64 * 1024;
+
+  explicit AdminBackpressureRequest(std::shared_ptr<AdminBackpressureState> state)
+      : state_(std::move(state)) {}
+  ~AdminBackpressureRequest() override { state_->destroyed.Notify(); }
+  Http::Code start(Http::ResponseHeaderMap&) override { return Http::Code::OK; }
+  bool nextChunk(Buffer::Instance& response) override {
+    response.add(std::string(ChunkSize, 'x'));
+    return ++state_->chunks < ChunkCount;
+  }
+
+private:
+  const std::shared_ptr<AdminBackpressureState> state_;
+};
+
 } // namespace
+
+TEST_P(IntegrationAdminTest, PausedAdminResponseCanResumeOrBeCancelled) {
+  initialize();
+  for (const bool cancel : {false, true}) {
+    auto state = std::make_shared<AdminBackpressureState>();
+    absl::Notification installed;
+    test_server_->server().dispatcher().post([&, state]() {
+      EXPECT_TRUE(test_server_->server().admin()->addStreamingHandler(
+          "/backpressure", "chunked response for integration testing",
+          [state](Server::AdminStream&) {
+            return std::make_unique<AdminBackpressureRequest>(state);
+          },
+          true, false));
+      installed.Notify();
+    });
+    installed.WaitForNotification();
+    auto client = makeHttpConnection(lookupPort("admin"));
+    client->connection()->readDisable(true);
+    auto response =
+        client->makeHeaderOnlyRequest(Http::TestRequestHeaderMapImpl{{":method", "GET"},
+                                                                     {":path", "/backpressure"},
+                                                                     {":scheme", "http"},
+                                                                     {":authority", "localhost"}});
+    ASSERT_TRUE(response->waitForWithDispatcherRun([&]() { return state->chunks.load() != 0; },
+                                                   "admin response production",
+                                                   TestUtility::DefaultTimeout));
+    BufferingStreamDecoderPtr probe;
+    ASSERT_EQ("200", request("admin", "GET", "/server_info", probe));
+    EXPECT_LT(state->chunks.load(), AdminBackpressureRequest::ChunkCount);
+    EXPECT_FALSE(state->destroyed.HasBeenNotified());
+    if (cancel) {
+      client->close();
+    } else {
+      client->connection()->readDisable(false);
+      ASSERT_TRUE(response->waitForEndStream());
+      EXPECT_EQ(AdminBackpressureRequest::ChunkCount * AdminBackpressureRequest::ChunkSize,
+                response->body().size());
+      EXPECT_EQ(std::string::npos, response->body().find_first_not_of('x'));
+      client->close();
+    }
+    ASSERT_TRUE(state->destroyed.WaitForNotificationWithTimeout(
+        absl::Milliseconds(TestUtility::DefaultTimeout.count())));
+    absl::Notification removed;
+    test_server_->server().dispatcher().post([&]() {
+      EXPECT_TRUE(test_server_->server().admin()->removeHandler("/backpressure"));
+      removed.Notify();
+    });
+    removed.WaitForNotification();
+  }
+}
+
+TEST_P(IntegrationAdminTest, AdminRequestBufferLimitsRemainProtocolSpecific) {
+  initialize();
+  absl::Notification installed;
+  test_server_->server().dispatcher().post([&]() {
+    EXPECT_TRUE(test_server_->server().admin()->addHandler(
+        "/body-size", "buffered request compatibility check",
+        [](Http::ResponseHeaderMap&, Buffer::Instance& output, Server::AdminStream& stream) {
+          output.add(std::to_string(stream.getRequestBody()->length()));
+          return Http::Code::OK;
+        },
+        true, true));
+    installed.Notify();
+  });
+  installed.WaitForNotification();
+  for (const uint64_t size : {2 * 1024 * 1024, 17 * 1024 * 1024}) {
+    auto client = makeHttpConnection(lookupPort("admin"));
+    auto response =
+        client->makeRequestWithBody(Http::TestRequestHeaderMapImpl{{":method", "POST"},
+                                                                   {":path", "/body-size"},
+                                                                   {":scheme", "http"},
+                                                                   {":authority", "localhost"}},
+                                    size);
+    ASSERT_TRUE(response->waitForEndStream());
+    if (size > 16 * 1024 * 1024 && downstreamProtocol() == Http::CodecType::HTTP2) {
+      EXPECT_EQ("413", response->headers().getStatusValue());
+    } else {
+      EXPECT_EQ("200", response->headers().getStatusValue());
+      EXPECT_EQ(std::to_string(size), response->body());
+    }
+    client->close();
+  }
+}
 
 TEST_P(IntegrationAdminTest, PrometheusResponseSpansChunks) {
   initialize();
