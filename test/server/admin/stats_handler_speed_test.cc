@@ -1,6 +1,8 @@
 // Note: this should be run with --compilation_mode=opt, and would benefit from a
 // quiescent system with disabled cstate power management.
 
+#include <algorithm>
+
 #include "source/common/buffer/buffer_impl.h"
 #include "source/common/http/header_map_impl.h"
 #include "source/common/stats/custom_stat_namespaces_impl.h"
@@ -236,13 +238,15 @@ public:
   bool endpoint_stats_initialized_{false};
 };
 
-// Unlike the existing many-family fixture, these benchmarks put all labeled instances in one
-// family per stat type. Run each mode in a separate process when measuring peak memory.
+// Vary both metric cardinality and the number of families per stat type. Run each mode in a
+// separate process when measuring peak memory.
 class PrometheusCardinalityFixture : public Stats::ThreadLocalRealThreadsMixin {
 public:
-  PrometheusCardinalityFixture(uint64_t counters, uint64_t histograms)
+  PrometheusCardinalityFixture(uint64_t counters, uint64_t histograms,
+                               uint64_t families_per_type = 1)
       : ThreadLocalRealThreadsMixin(1), counter_instances_(counters),
         histogram_instances_(histograms) {
+    RELEASE_ASSERT(families_per_type > 0, "expected a positive family count");
     absl::Notification merged;
     runOnMainBlocking([&]() {
       Stats::StatNameTagVector tags{
@@ -251,10 +255,18 @@ public:
           {makeStatName("method"), makeStatName("GET")},
           {makeStatName("route"), makeStatName("/api/v1/resources/{resource_id}/operations")}};
       for (const bool histograms : {false, true}) {
-        const auto family = makeStatName(histograms ? "benchmark.request_duration_ms"
-                                                    : "benchmark.requests_completed");
         const uint64_t instances = histograms ? histogram_instances_ : counter_instances_;
+        const uint64_t family_count = std::min(instances, families_per_type);
+        std::vector<Stats::StatName> families;
+        for (uint64_t i = 0; i < family_count; ++i) {
+          const absl::string_view base =
+              histograms ? "benchmark.request_duration_ms" : "benchmark.requests_completed";
+          families.push_back(makeStatName(
+              families_per_type == 1 ? std::string(base) : fmt::format("{}.family_{}", base, i)));
+        }
+        families_ += family_count;
         for (uint64_t i = 0; i < instances; ++i) {
+          const auto family = families[i % families.size()];
           Stats::StatNameManagedStorage instance(fmt::format("{:07d}", i), symbol_table_);
           tags[0].second = instance.statName();
           if (histograms) {
@@ -336,6 +348,7 @@ public:
 
   const uint64_t counter_instances_;
   const uint64_t histogram_instances_;
+  uint64_t families_{0};
   uint64_t finite_buckets_{0};
   Stats::CustomStatNamespacesImpl custom_namespaces_;
   FastMockClusterManager cm_;
@@ -355,7 +368,8 @@ Envoy::Server::StatsHandlerTest& testContext(bool per_endpoint_enabled) {
   return context;
 }
 
-static void bmPrometheusCardinality(benchmark::State& state, bool buffered) {
+static void benchmarkPrometheusMetrics(benchmark::State& state, bool buffered,
+                                       uint64_t families_per_type) {
   const uint64_t counters = state.range(0);
   const uint64_t histograms = state.range(1);
   if (Envoy::benchmark::skipExpensiveBenchmarks() && (counters > 100 || histograms > 10)) {
@@ -364,7 +378,7 @@ static void bmPrometheusCardinality(benchmark::State& state, bool buffered) {
   }
   Envoy::Event::Libevent::Global::initialize();
   // Construction, histogram merging, validation, and destruction are outside the timed loop.
-  Envoy::Server::PrometheusCardinalityFixture fixture(counters, histograms);
+  Envoy::Server::PrometheusCardinalityFixture fixture(counters, histograms, families_per_type);
   uint64_t bytes = 0;
   for (auto _ : state) { // NOLINT
     bytes = fixture.render(buffered);
@@ -373,7 +387,7 @@ static void bmPrometheusCardinality(benchmark::State& state, bool buffered) {
   Envoy::Server::PrometheusCardinalityFixture::OutputDigest digest;
   fixture.render(buffered, &digest);
   RELEASE_ASSERT(digest.bytes_ == bytes, "output length changed between renders");
-  state.counters["families"] = (counters != 0 ? 1 : 0) + (histograms != 0 ? 1 : 0);
+  state.counters["families"] = fixture.families_;
   state.counters["counter_instances"] = counters;
   state.counters["histogram_instances"] = histograms;
   state.counters["finite_buckets_per_histogram"] = fixture.finite_buckets_;
@@ -382,6 +396,31 @@ static void bmPrometheusCardinality(benchmark::State& state, bool buffered) {
   state.SetBytesProcessed(state.iterations() * bytes);
   state.SetLabel(fmt::format("fnv1a64={:016x}", digest.checksum_));
 }
+
+static void bmPrometheusCardinality(benchmark::State& state, bool buffered) {
+  benchmarkPrometheusMetrics(state, buffered, 1);
+}
+
+static void bmPrometheusFamilyDistribution(benchmark::State& state, bool buffered) {
+  benchmarkPrometheusMetrics(state, buffered, state.range(2));
+}
+
+BENCHMARK_CAPTURE(bmPrometheusFamilyDistribution, buffered, true)
+    ->ArgNames({"counters", "histograms", "families_per_type"})
+    ->Args({100, 10, 10})
+    ->Args({1000000, 0, 100})
+    ->Args({1000000, 0, 1000})
+    ->Args({100000, 10000, 100})
+    ->Iterations(1)
+    ->Unit(benchmark::kMillisecond);
+BENCHMARK_CAPTURE(bmPrometheusFamilyDistribution, streaming, false)
+    ->ArgNames({"counters", "histograms", "families_per_type"})
+    ->Args({100, 10, 10})
+    ->Args({1000000, 0, 100})
+    ->Args({1000000, 0, 1000})
+    ->Args({100000, 10000, 100})
+    ->Iterations(1)
+    ->Unit(benchmark::kMillisecond);
 
 BENCHMARK_CAPTURE(bmPrometheusCardinality, buffered, true)
     ->ArgNames({"counters", "histograms"})
