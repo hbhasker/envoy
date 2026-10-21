@@ -6,6 +6,20 @@ licenses(["notice"])  # Apache 2
 envoy_package()
 
 envoy_py_test(
+    name = "admin_scrape_benchmark_test",
+    size = "large",
+    srcs = ["admin_scrape_benchmark_test.py"],
+    args = ["--envoy-binary=$(location //test/server/admin/benchmark:envoy_scrape_server)"],
+    data = ["//test/server/admin/benchmark:envoy_scrape_server"],
+    tags = [
+        "no_san",
+        "nocoverage",
+    ],
+    target_compatible_with = ["@platforms//os:linux"],
+    deps = ["//test/server/admin/benchmark:controller_lib"],
+)
+
+envoy_py_test(
     name = "hotrestart_handoff_test",
     # This is not actually large, but setting large makes the test skip for
     # asan and tsan.
