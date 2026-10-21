@@ -8,6 +8,19 @@ modify different aspects of the server:
 
 * :ref:`v3 API reference <envoy_v3_api_msg_config.bootstrap.v3.Admin>`
 
+Chunked response delivery
+------------------------
+
+Admin handlers that generate response chunks pause when downstream write buffers are backed up
+and resume after those buffers drain. The write-buffer watermark is a soft threshold: an individual
+chunk, codec buffers, retained request state and concurrent requests can require additional memory.
+Handlers that construct a complete buffered response do not gain bounded generation memory.
+
+Disconnecting or resetting the stream cancels pending response production and releases its request
+state. A connected client that stops reading can retain unsent request state; backpressure does not
+introduce a new timeout. Handlers that write asynchronously outside the chunk API are not
+automatically throttled by this mechanism.
+
 .. _operations_admin_interface_security:
 
 .. attention::

@@ -3,6 +3,7 @@
 #include <functional>
 #include <list>
 
+#include "envoy/event/schedulable_cb.h"
 #include "envoy/http/filter.h"
 #include "envoy/server/admin.h"
 
@@ -22,6 +23,7 @@ namespace Server {
  */
 class AdminFilter : public Http::PassThroughFilter,
                     public AdminStream,
+                    public Http::DownstreamWatermarkCallbacks,
                     Logger::Loggable<Logger::Id::admin> {
 public:
   using AdminServerCallbackFunction = std::function<Http::Code(
@@ -43,10 +45,15 @@ public:
   void onDestroy() override;
 
   // Http::StreamDecoderFilter
+  void setDecoderFilterCallbacks(Http::StreamDecoderFilterCallbacks& callbacks) override;
   Http::FilterHeadersStatus decodeHeaders(Http::RequestHeaderMap& headers,
                                           bool end_stream) override;
   Http::FilterDataStatus decodeData(Buffer::Instance& data, bool end_stream) override;
   Http::FilterTrailersStatus decodeTrailers(Http::RequestTrailerMap& trailers) override;
+
+  // Http::DownstreamWatermarkCallbacks
+  void onAboveWriteBufferHighWatermark() override;
+  void onBelowWriteBufferLowWatermark() override;
 
   // AdminStream
   void setEndStreamOnComplete(bool end_stream) override { end_stream_on_complete_ = end_stream; }
@@ -64,10 +71,17 @@ private:
    * Called when an admin request has been completely received.
    */
   void onComplete();
+  void pumpResponse();
+  void scheduleResume(bool next_iteration = false);
   const Admin& admin_;
   Http::RequestHeaderMap* request_headers_{};
   std::list<std::function<void()>> on_destroy_callbacks_;
   bool end_stream_on_complete_ = true;
+  Admin::RequestPtr request_;
+  Event::SchedulableCallbackPtr resume_callback_;
+  uint32_t high_watermark_count_{0};
+  bool watermark_callbacks_registered_{false};
+  bool destroyed_{false};
 };
 
 } // namespace Server

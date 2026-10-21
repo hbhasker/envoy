@@ -401,7 +401,7 @@ private:
     }
     bool bindToPort() const override { return true; }
     bool handOffRestoredDestinationConnections() const override { return false; }
-    uint32_t perConnectionBufferLimitBytes() const override { return 0; }
+    uint32_t perConnectionBufferLimitBytes() const override { return 256 * 1024; }
     std::chrono::milliseconds perConnectionBufferHighWatermarkTimeout() const override {
       return std::chrono::milliseconds::zero();
     }

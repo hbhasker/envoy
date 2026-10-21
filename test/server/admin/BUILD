@@ -82,6 +82,7 @@ envoy_cc_test(
     deps = [
         "//source/common/buffer:buffer_lib",
         "//source/server/admin:admin_lib",
+        "//test/mocks/event:event_mocks",
         "//test/mocks/http:http_mocks",
         "//test/mocks/server:admin_mocks",
         "//test/test_common:environment_lib",
